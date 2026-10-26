@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "redcastle"
+version = "0.1.0"
+description = "A guarded deletion pipeline for AI agents: they may ask to delete, only a human decides."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "babayaga370" }]
+requires-python = ">=3.11"
+dependencies = []
+keywords = ["ai-agents", "mcp", "safety", "guardrails", "human-in-the-loop", "deletion", "quarantine"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security",
+]
+
+[project.optional-dependencies]
+s3 = ["boto3>=1.28"]
+
+[project.urls]
+Homepage = "https://github.com/babayaga370/red-castle"
+Issues = "https://github.com/babayaga370/red-castle/issues"
+
+[project.scripts]
+redcastle = "redcastle.cli:main"
+
+[tool.setuptools]
+packages = ["redcastle", "redcastle.storage"]
