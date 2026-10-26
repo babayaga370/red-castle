@@ -322,7 +322,8 @@ The only irreversible call in the whole system is then made with the Executioner
 python -m unittest discover -s tests -t .
 ```
 
-CI runs the tests on Windows, macOS and Linux with Python 3.11–3.14.
+CI runs the tests on Windows and Linux with Python 3.11–3.14. macOS is supported
+(notifications use `osascript`) but not tested in CI.
 
 ## License
 
