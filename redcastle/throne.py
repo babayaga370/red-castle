@@ -10,6 +10,9 @@ from .seal import royal_seal
 from .storage import InvalidKey, ObjectExists, ObjectNotFound, normalize_key
 from .util import now
 
+# Approved cases still count: the Executioner has not struck yet, or refused to.
+RESTORABLE = (Status.QUARANTINED, Status.APPROVED)
+
 
 class ThroneError(Exception):
     def __init__(self, message: str, code: str = "conflict") -> None:
@@ -41,22 +44,22 @@ class ThroneRoom:
     def pending(self) -> list[dict]:
         return self.registry.list_requests(status=Status.QUARANTINED, oldest_first=True)
 
+    def unfinished(self) -> list[dict]:
+        """Approved cases the Executioner has not carried out, usually because it refused."""
+        return self.registry.list_requests(status=Status.APPROVED, oldest_first=True)
+
     def case(self, request_id: str) -> dict:
         case = self.registry.get_request(request_id)
         if case is None:
             raise ThroneError(f"There is no case {request_id}.", "not_found")
         return case
 
-    def _quarantined(self, request_id: str, verb: str) -> dict:
-        case = self.case(request_id)
-        if case["status"] != Status.QUARANTINED:
-            raise ThroneError(f"Case {request_id} is '{case['status']}'; only quarantined cases can be {verb}.")
-        return case
-
     def approve(self, request_id: str, *, by: str, note: str = "") -> dict:
         """Seal a death warrant and hand it to the Executioner."""
         by = _who(by)
-        case = self._quarantined(request_id, "approved")
+        case = self.case(request_id)
+        if case["status"] != Status.QUARANTINED:
+            raise ThroneError(f"Case {request_id} is '{case['status']}'; only quarantined cases can be approved.")
         seal = royal_seal(self._seal_key, case["id"], case["quarantine_location"], case["checksum"])
         if not self.registry.transition(
             request_id, Status.QUARANTINED, Status.APPROVED,
@@ -76,7 +79,9 @@ class ThroneRoom:
     def restore(self, request_id: str, *, by: str, note: str = "", target_key: str | None = None) -> dict:
         """Decline the deletion and put the object back (optionally under a new key)."""
         by = _who(by)
-        case = self._quarantined(request_id, "restored")
+        case = self.case(request_id)
+        if case["status"] not in RESTORABLE:
+            raise ThroneError(f"Case {request_id} is '{case['status']}'; its object is no longer in quarantine.")
         try:
             target = normalize_key(target_key) if target_key else case["object_key"]
             self.quarantine.release(request_id, case["quarantine_location"], target)
@@ -88,11 +93,14 @@ class ThroneRoom:
             raise ThroneError(f"The quarantined object of case {request_id} is missing.") from exc
         except InvalidKey as exc:
             raise ThroneError(str(exc), "bad_request") from exc
-        self.registry.transition(
-            request_id, Status.QUARANTINED, Status.RESTORED,
-            decided_by=by, decided_at=now(), decision_note=note or None,
+        except Exception as exc:  # noqa: BLE001 - its folder became a file, say, or the storage is down
+            raise ThroneError(f"Could not restore case {request_id}: {exc}") from exc
+        if not self.registry.transition(
+            request_id, case["status"], Status.RESTORED,
+            seal=None, decided_by=by, decided_at=now(), decision_note=note or None,
             status_reason=f"Restored as '{target}'." if target != case["object_key"] else None,
-        )
+        ):
+            raise ThroneError(f"Case {request_id} changed while you were deciding; the object is back as '{target}'.")
         self.chronicle.record(
             f"human:{by}", "throne.restored",
             request_id=request_id, key=case["object_key"], restored_as=target, agent=case["agent"], note=note,

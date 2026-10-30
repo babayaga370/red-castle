@@ -35,8 +35,8 @@ class ObjectInfo:
         return {"key": self.key, "size": self.size, "modified": iso(self.modified)}
 
 
-_CONTROL = re.compile(r"[\x00-\x1f\x7f]")
-_CASE_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f\ud800-\udfff]")  # C0, DEL, C1 and broken Unicode
+_CASE_ID = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 
 def normalize_key(key: object) -> str:
@@ -47,14 +47,14 @@ def normalize_key(key: object) -> str:
     if not normalized or len(normalized) > 1024:
         raise InvalidKey("The object key must be 1-1024 characters long.")
     if _CONTROL.search(normalized):
-        raise InvalidKey("The object key must not contain control characters.")
+        raise InvalidKey("The object key must not contain control characters or broken Unicode.")
     if any(part in ("", ".", "..") for part in normalized.split("/")):
         raise InvalidKey("The object key must not contain empty, '.' or '..' path segments.")
     return normalized
 
 
 def check_case_id(case_id: str) -> str:
-    if not _CASE_ID.match(case_id):
+    if not _CASE_ID.fullmatch(case_id):
         raise InvalidKey(f"Invalid case id: {case_id!r}")
     return case_id
 
@@ -69,6 +69,14 @@ class Backend(ABC):
 
     def __init__(self, *, can_purge: bool = False) -> None:
         self.can_purge = can_purge
+
+    def canonical_key(self, key: str) -> str:
+        """The one name an object goes by here, whichever way ``key`` spells it.
+
+        Every policy decision must be made on this name: a check on anything
+        else can be walked around by spelling the same object differently.
+        """
+        return normalize_key(key)
 
     @abstractmethod
     def list_objects(self, prefix: str = "") -> list[ObjectInfo]:
@@ -93,6 +101,10 @@ class Backend(ABC):
     @abstractmethod
     def unhide(self, location: str, key: str) -> None:
         """Bring a quarantined object back as ``key``; ObjectExists if taken."""
+
+    @abstractmethod
+    def find_hidden(self, key: str, case_id: str) -> str | None:
+        """Where a request that was cut short left its object, or None if it never got there."""
 
     @abstractmethod
     def quarantined_checksum(self, location: str) -> str | None:

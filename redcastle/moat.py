@@ -7,6 +7,8 @@ from .registry import Registry
 from .storage import InvalidKey, normalize_key
 from .util import glob_match, now
 
+FROZEN_MESSAGE = "This agent is frozen by the Throne Room and may not submit deletion requests."
+
 
 class MoatViolation(Exception):
     def __init__(self, code: str, message: str) -> None:
@@ -19,12 +21,17 @@ class Moat:
         self.config = config
         self.registry = registry
 
+    def flooding(self, agent: str) -> bool:
+        """Far past its limits: its requests no longer even get a line in the records, or it could fill the disk."""
+        t = now()
+        return (
+            self.registry.count_requests(agent, t - 60) >= 2 * self.config.max_requests_per_minute
+            or self.registry.count_requests(agent, t - 86400) >= 2 * self.config.max_requests_per_day
+        )
+
     def check_agent(self, agent: dict) -> None:
         if agent["status"] != "active":
-            raise MoatViolation(
-                "agent_frozen",
-                "This agent is frozen by the Throne Room and may not submit deletion requests.",
-            )
+            raise MoatViolation("agent_frozen", FROZEN_MESSAGE)
 
     def check_form(self, key: object, reason: object, risk_score: object) -> tuple[str, int]:
         """Validate the request's shape. Returns the normalized key and score."""

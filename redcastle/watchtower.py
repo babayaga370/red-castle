@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import json
 import logging
+import sqlite3
 import threading
+import time
 import urllib.request
 from typing import TYPE_CHECKING, Any
 
@@ -22,6 +24,7 @@ if TYPE_CHECKING:
 
 log = logging.getLogger("redcastle.watchtower")
 _LOG_LEVELS = {"info": logging.INFO, "warning": logging.WARNING, "critical": logging.CRITICAL}
+_HELD = (Status.QUARANTINED, Status.APPROVED)  # the statuses whose object sits in quarantine
 
 
 class Watchtower:
@@ -39,6 +42,8 @@ class Watchtower:
         self.config = config
         self.notifier = notifier
         self._open_problems: set[str] = set()
+        self._chronicle_peak = 0
+        self._deliveries: list[threading.Thread] = []
 
     # -- alerts ---------------------------------------------------------------
 
@@ -53,26 +58,32 @@ class Watchtower:
         **data: Any,
     ) -> dict:
         ts = now()
-        cur = self.db.execute(
-            "INSERT INTO alerts (ts, severity, kind, agent, message, data) VALUES (?, ?, ?, ?, ?, ?)",
-            (ts, severity, kind, agent, message, json.dumps(data, default=str, sort_keys=True)),
-        )
         log.log(_LOG_LEVELS.get(severity, logging.WARNING), "[%s] %s", kind, message)
-        self.chronicle.record(
-            "watchtower", "watchtower.alert", severity=severity, kind=kind, agent=agent, message=message, **data
-        )
+        alert_id = None
+        try:
+            alert_id = self.db.execute(
+                "INSERT INTO alerts (ts, severity, kind, agent, message, data) VALUES (?, ?, ?, ?, ?, ?)",
+                (ts, severity, kind, agent, message, json.dumps(data, default=str, sort_keys=True)),
+            ).lastrowid
+            self.chronicle.record(
+                "watchtower", "watchtower.alert", severity=severity, kind=kind, agent=agent, message=message, **data
+            )
+        except sqlite3.Error:  # the horn must sound even if the records cannot be kept
+            log.exception("Could not record the alert")
         alert = {
-            "id": cur.lastrowid, "ts": iso(ts), "severity": severity, "kind": kind,
+            "id": alert_id, "ts": iso(ts), "severity": severity, "kind": kind,
             "agent": agent, "message": message, "data": data,
         }
         if self.config.webhook_url and severity != "info":
-            threading.Thread(target=self._post_webhook, args=(alert,), daemon=True).start()
+            thread = threading.Thread(target=self._post_webhook, args=(alert,), daemon=True)
+            self._deliveries.append(thread)
+            thread.start()
         if notify:
             self.notifier.alert(severity, message)
         return alert
 
     def _post_webhook(self, alert: dict) -> None:
-        body = json.dumps({"source": "red-castle", **alert}, default=str).encode("utf-8")
+        body = json.dumps({"source": "red-castle", **alert}, default=str).encode("utf-8", "backslashreplace")
         request = urllib.request.Request(
             self.config.webhook_url, data=body, method="POST", headers={"Content-Type": "application/json"}
         )
@@ -80,6 +91,14 @@ class Watchtower:
             urllib.request.urlopen(request, timeout=10).close()
         except Exception as exc:  # noqa: BLE001 - a failed webhook must never break the castle
             log.warning("Webhook delivery failed: %s", exc)
+        finally:
+            self._deliveries.remove(threading.current_thread())
+
+    def close(self, timeout: float = 15) -> None:
+        """Wait for webhooks under way: a short-lived command must not swallow its alerts."""
+        deadline = time.monotonic() + timeout
+        for thread in list(self._deliveries):
+            thread.join(max(0, deadline - time.monotonic()))
 
     def alerts(self, limit: int = 50) -> list[dict]:
         rows = self.db.all("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (limit,))
@@ -133,7 +152,8 @@ class Watchtower:
 
         Raises one alert per new problem; problems already reported on the
         previous patrol are not reported again. Also reminds the human about
-        cases that have waited too long.
+        cases that have waited too long. Something that cannot be checked is a
+        problem in itself: it must never stop the rest of the patrol.
         """
         problems: list[dict] = []
         verification = self.chronicle.verify()
@@ -144,17 +164,35 @@ class Watchtower:
                 "message": f"The Chronicle fails verification at entry {verification.broken_at}: "
                            f"{verification.problem}.",
             })
+        elif verification.entries < self._chronicle_peak:
+            problems.append({
+                "id": "chronicle:shrank",
+                "kind": "chronicle_tampered",
+                "message": f"The Chronicle shrank from {self._chronicle_peak} to {verification.entries} entries.",
+            })
+        self._chronicle_peak = max(self._chronicle_peak, verification.entries)
         for issue in traps.inspect():
             problems.append({
                 "id": f"canary:{issue['key']}:{issue['problem']}",
                 "kind": "canary_disturbed",
-                "message": f"Canary '{issue['key']}' is {issue['problem']} - something touched it "
+                "message": f"Canary '{issue['key']}' could not be checked: {issue['error']}." if "error" in issue else
+                           f"Canary '{issue['key']}' is {issue['problem']} - something touched it "
                            "without going through the Gateway.",
             })
-        held = self.registry.list_requests(status=(Status.QUARANTINED, Status.APPROVED), limit=1_000_000)
+        held = self.registry.list_requests(status=_HELD, limit=1_000_000)
         for case in held:
-            current = backend.quarantined_checksum(case["quarantine_location"])
-            if current != case["checksum"]:
+            try:
+                current = backend.quarantined_checksum(case["quarantine_location"])
+            except Exception as exc:  # noqa: BLE001 - locked by another program, say, or the storage is down
+                problems.append({
+                    "id": f"quarantine:{case['id']}:unreadable",
+                    "kind": "quarantine_unreadable",
+                    "message": f"The quarantined object of case {case['id']} ('{case['object_key']}') "
+                               f"could not be checked: {exc}.",
+                })
+                continue
+            # A human may have decided the case from the terminal since we listed it.
+            if current != case["checksum"] and self.registry.get_request(case["id"])["status"] in _HELD:
                 state = "missing" if current is None else "altered"
                 problems.append({
                     "id": f"quarantine:{case['id']}:{state}",

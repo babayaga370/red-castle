@@ -43,7 +43,10 @@ class Executioner:
         location, checksum = case["quarantine_location"], case["checksum"]
         if not seal_is_valid(self._seal_key, case["seal"], case["id"], location, checksum):
             raise self._refuse(case, "the royal seal is missing or forged", alarm=True)
-        current = self.backend.quarantined_checksum(location)
+        try:
+            current = self.backend.quarantined_checksum(location)
+        except Exception as exc:  # noqa: BLE001 - what cannot be verified is not struck
+            raise self._refuse(case, f"the quarantine could not be read: {exc}", alarm=True) from exc
         if current is None:
             raise self._refuse(case, "the object is no longer in quarantine", alarm=True)
         if current != checksum:

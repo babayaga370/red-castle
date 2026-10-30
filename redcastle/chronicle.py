@@ -19,6 +19,7 @@ from .db import Database
 
 log = logging.getLogger("redcastle.chronicle")
 GENESIS = "0" * 64
+VERIFY_PAGE = 5000  # entries read at a time, so a long chain never holds up the Gateway for long
 
 
 @dataclass
@@ -58,18 +59,30 @@ class Chronicle:
         """Walk the whole chain and report the first entry that does not check out."""
         expected_prev = GENESIS
         count = 0
-        rows = self.db.all("SELECT * FROM chronicle ORDER BY seq")
-        for expected_seq, row in enumerate(rows, start=1):
-            if row["seq"] != expected_seq:
-                return Verification(False, count, expected_seq, f"entry {expected_seq} is missing")
-            if row["prev_hash"] != expected_prev:
-                return Verification(False, count, row["seq"], "the link to the previous entry is broken")
-            digest = self._digest(row["seq"], row["ts"], row["actor"], row["event"], row["data"], row["prev_hash"])
-            if not hmac.compare_digest(digest, row["hash"]):
-                return Verification(False, count, row["seq"], "the entry was altered")
-            expected_prev = row["hash"]
-            count += 1
+        while rows := self.db.all("SELECT * FROM chronicle WHERE seq > ? ORDER BY seq LIMIT ?", (count, VERIFY_PAGE)):
+            for row in rows:
+                expected_seq = count + 1
+                if row["seq"] != expected_seq:
+                    return Verification(False, count, expected_seq, f"entry {expected_seq} is missing")
+                if row["prev_hash"] != expected_prev:
+                    return Verification(False, count, row["seq"], "the link to the previous entry is broken")
+                if not self._intact(row):
+                    return Verification(False, count, row["seq"], "the entry was altered")
+                expected_prev = row["hash"]
+                count += 1
         return Verification(True, count)
+
+    def _intact(self, row: Any) -> bool:
+        try:
+            digest = self._digest(row["seq"], row["ts"], row["actor"], row["event"], row["data"], row["prev_hash"])
+            return hmac.compare_digest(digest.encode("utf-8"), str(row["hash"]).encode("utf-8"))
+        except (TypeError, ValueError):  # not even the right kind of value: tampered with, not a crash
+            return False
+
+    def holds(self, seq: int, digest: str) -> bool:
+        """Whether entry ``seq`` still carries this seal: did a published head survive?"""
+        row = self.db.one("SELECT hash FROM chronicle WHERE seq = ?", (seq,))
+        return row is not None and row["hash"] == digest
 
     def entries(self, limit: int = 50, *, request_id: str | None = None) -> list[dict]:
         """Newest entries first, optionally only those about one request."""

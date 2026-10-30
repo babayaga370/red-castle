@@ -43,17 +43,22 @@ class LocalBackend(Backend):
         self.quarantine_dir.mkdir(parents=True, exist_ok=True)
         # The castle's own files are never part of the realm, even if the realm
         # is configured to be the folder the castle lives in.
-        self.reserved = [Path(p).resolve() for p in (*reserved, self.quarantine_dir)]
+        self.reserved = [Path(str(Path(p).resolve()).casefold()) for p in (*reserved, self.quarantine_dir)]
 
     def _is_reserved(self, path: Path) -> bool:
-        return any(path == r or path.is_relative_to(r) for r in self.reserved)
+        # Not every disk cares about case, so neither does this check.
+        folded = Path(str(path).casefold())
+        return any(folded == r or folded.is_relative_to(r) for r in self.reserved)
 
     def _path(self, key: str) -> Path:
         key = normalize_key(key)
         if os.name == "nt" and ":" in key:
             raise InvalidKey("Object keys must not contain ':' on Windows.")
         candidate = self.realm / key
-        resolved = candidate.resolve()
+        try:
+            resolved = candidate.resolve()
+        except (OSError, RuntimeError) as exc:  # a loop of links, for one
+            raise InvalidKey(f"'{key}' cannot be resolved.") from exc
         if resolved == self.realm or not resolved.is_relative_to(self.realm):
             raise InvalidKey(f"'{key}' points outside the realm.")
         if self._is_reserved(resolved):
@@ -64,6 +69,11 @@ class LocalBackend(Backend):
 
     def _cell(self, location: str) -> Path:
         return self.quarantine_dir / check_case_id(location)
+
+    def canonical_key(self, key: str) -> str:
+        # The disk answers to more names than the real one - 'a.pem.', 'a.pem ' and
+        # short names like 'SECRET~1.TXT' on Windows, and any folder link anywhere.
+        return self._path(key).resolve().relative_to(self.realm).as_posix()
 
     def list_objects(self, prefix: str = "") -> list[ObjectInfo]:
         prefix = prefix.replace("\\", "/").lstrip("/")
@@ -80,7 +90,10 @@ class LocalBackend(Backend):
                     continue
                 key = path.relative_to(self.realm).as_posix()
                 if key.startswith(prefix):
-                    st = path.stat()
+                    try:
+                        st = path.stat()
+                    except OSError:  # gone since we looked: one file must not fail the whole listing
+                        continue
                     found.append(ObjectInfo(key, st.st_size, st.st_mtime))
         return sorted(found, key=lambda o: o.key)
 
@@ -106,7 +119,12 @@ class LocalBackend(Backend):
             raise ObjectNotFound(key)
         cell = self._cell(case_id)
         cell.mkdir(parents=True, exist_ok=False)
-        shutil.move(source, cell / "object")
+        try:
+            shutil.move(source, cell / "object")
+        except Exception:
+            if source.is_file():  # a move that failed half-way may leave a stray copy behind
+                shutil.rmtree(cell, ignore_errors=True)
+            raise
         return case_id
 
     def unhide(self, location: str, key: str) -> None:
@@ -123,6 +141,9 @@ class LocalBackend(Backend):
             cell.rmdir()
         except OSError:
             pass
+
+    def find_hidden(self, key: str, case_id: str) -> str | None:
+        return case_id if (self._cell(case_id) / "object").is_file() else None
 
     def quarantined_checksum(self, location: str) -> str | None:
         path = self._cell(location) / "object"

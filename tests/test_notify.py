@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import time
 import unittest
+from unittest import mock
 
+from redcastle import notify
 from redcastle.config import NotifyConfig
 from redcastle.notify import Notifier, compose
 
@@ -52,6 +54,12 @@ class NotifierTests(unittest.TestCase):
         self.assertEqual(self.sent[0][1], "fire")
         self.assertTrue(self.sent[0][3])
 
+    def test_agent_text_is_defused_before_it_reaches_the_screen(self) -> None:
+        self.config.batch_seconds = 0
+        self.notifier.awaiting(case(key="report‮txt.exe"))
+        self.assertNotIn("‮", self.sent[0][1])
+        self.assertIn("\\u202e", self.sent[0][1])
+
     def test_disabled(self) -> None:
         self.config.enabled = False
         self.notifier.alert("critical", "fire")
@@ -85,6 +93,18 @@ class NotifierTests(unittest.TestCase):
         _, line1, line2, _ = compose([], [case(key="config/prod.env", flag="underestimated")])
         self.assertIn("config/prod.env", line1)
         self.assertIn("UNDERESTIMATED", line2)
+
+
+class PlantedProgramTests(unittest.TestCase):
+    def test_programs_are_never_looked_up_by_bare_name(self) -> None:
+        # Windows would otherwise run a powershell.exe planted in the current folder.
+        with mock.patch("redcastle.notify.subprocess.run") as run:
+            run.return_value.returncode = 0
+            notify._windows_toast("title", "one", "two", False)
+            notify._macos_notification("title", "one", "two", False)
+        programs = [call.args[0][0] for call in run.call_args_list]
+        self.assertIn("System32", programs[0])
+        self.assertEqual(programs[1], "/usr/bin/osascript")
 
 
 class CastleNotificationTests(CastleTestCase):

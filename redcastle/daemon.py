@@ -1,13 +1,21 @@
-"""Running the castle silently in the background: pid file, stop flag, process checks."""
+"""Running the castle silently in the background: pid file, stop flag, process checks.
+
+A running server also holds the gate, an OS lock on a file in the state folder.
+The system lets go of it when the process dies, however that happens, so unlike
+a pid - which can come back as some other program - it cannot go stale.
+"""
 
 from __future__ import annotations
 
+import contextlib
 import os
 import signal
 import subprocess
 import sys
 import time
+from collections.abc import Iterator
 from pathlib import Path
+from typing import BinaryIO
 
 from .config import Config
 
@@ -27,6 +35,57 @@ def stop_path(config: Config) -> Path:
 
 def log_path(config: Config) -> Path:
     return config.state_dir / "castle.log"
+
+
+def gate_path(config: Config) -> Path:
+    return config.state_dir / "castle.gate"
+
+
+def _lock_gate(gate: BinaryIO) -> bool:
+    """Try to take the lock; never waits."""
+    try:
+        if os.name == "nt":
+            import msvcrt
+
+            gate.seek(0)
+            msvcrt.locking(gate.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+
+            fcntl.flock(gate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
+
+def _unlock_gate(gate: BinaryIO) -> None:
+    if os.name == "nt":
+        import msvcrt
+
+        with contextlib.suppress(OSError):
+            gate.seek(0)
+            msvcrt.locking(gate.fileno(), msvcrt.LK_UNLCK, 1)
+    gate.close()
+
+
+@contextlib.contextmanager
+def holding_gate(config: Config) -> Iterator[None]:
+    """Claim the castle for this process, or raise OSError if a server already holds it."""
+    with gate_path(config).open("ab") as gate:
+        if not _lock_gate(gate):
+            raise OSError("another castle is already running from this folder")
+        try:
+            yield
+        finally:
+            _unlock_gate(gate)
+
+
+def gate_held(config: Config) -> bool:
+    with gate_path(config).open("ab") as gate:
+        if not _lock_gate(gate):
+            return True
+        _unlock_gate(gate)
+        return False
 
 
 def pid_alive(pid: int) -> bool:
@@ -62,7 +121,7 @@ def running(config: Config) -> tuple[int, str] | None:
         pid, address = int(fields[0]), fields[1]
     except (OSError, ValueError, IndexError):
         return None
-    if pid_alive(pid):
+    if pid_alive(pid) and gate_held(config):
         return pid, address
     path.unlink(missing_ok=True)
     return None
@@ -93,7 +152,7 @@ def launch_background(config: Config, extra_args: list[str]) -> subprocess.Popen
         "stdin": subprocess.DEVNULL,
         "stdout": subprocess.DEVNULL,
         "stderr": subprocess.DEVNULL,
-        "cwd": str(config.root),
+        "cwd": str(config.state_dir),  # with -P below: nothing is ever loaded from a folder others can write to
         "close_fds": True,
     }
     if os.name == "nt":
@@ -107,7 +166,7 @@ def launch_background(config: Config, extra_args: list[str]) -> subprocess.Popen
     env = dict(os.environ)
     env["PYTHONPATH"] = os.pathsep.join(p for p in (package_parent, env.get("PYTHONPATH")) if p)
     kwargs["env"] = env
-    command = [executable, "-m", "redcastle", "--root", str(config.root), "serve", "--quiet", *extra_args]
+    command = [executable, "-P", "-m", "redcastle", "--root", str(config.root), "serve", "--quiet", *extra_args]
     if os.name != "nt":
         return subprocess.Popen(command, **kwargs)
     flags = DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP
@@ -133,7 +192,11 @@ def stop(config: Config, timeout: float = 15) -> str:
             stop_path(config).unlink(missing_ok=True)
             return "stopped"
         time.sleep(0.25)
-    os.kill(pid, signal.SIGTERM)
+    if running_pid(config) != pid:  # let go of the gate in the meantime
+        stop_path(config).unlink(missing_ok=True)
+        return "stopped"
+    with contextlib.suppress(OSError):  # it may just have exited
+        os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))  # Windows has no SIGKILL; there SIGTERM is final
     stop_path(config).unlink(missing_ok=True)
     pid_path(config).unlink(missing_ok=True)
     return "killed"

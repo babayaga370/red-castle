@@ -26,6 +26,7 @@ import time
 from collections.abc import Callable
 
 from .config import NotifyConfig
+from .util import printable, windows_tool
 
 log = logging.getLogger("redcastle.notify")
 
@@ -40,6 +41,8 @@ _CONTROL = re.compile(r"[\x00-\x1f\x7f]+")
 # machine, so toasts can be shown without installing a shortcut.
 _WINDOWS_APP_ID = r"{1AC14E77-02E7-4E5D-B744-2EB1AE5198B7}\WindowsPowerShell\v1.0\powershell.exe"
 _CREATE_NO_WINDOW = 0x08000000
+_POWERSHELL = r"WindowsPowerShell\v1.0\powershell.exe"
+_OSASCRIPT = "/usr/bin/osascript"
 
 # The texts arrive through environment variables and are XML-escaped here, so
 # nothing an agent writes (an object key, say) can inject markup or code.
@@ -63,7 +66,7 @@ $toast = [Windows.UI.Notifications.ToastNotification]::new($doc)
 
 
 def _clean(text: str, limit: int = 180) -> str:
-    text = _CONTROL.sub(" ", text).strip()
+    text = printable(_CONTROL.sub(" ", text)).strip()
     return text if len(text) <= limit else text[: limit - 3] + "..."
 
 
@@ -72,7 +75,7 @@ def _windows_toast(title: str, line1: str, line2: str, urgent: bool) -> None:
     env = dict(os.environ)
     env.update(RC_TITLE=title, RC_LINE1=line1, RC_LINE2=line2, RC_URGENT="1" if urgent else "0", RC_APPID=_WINDOWS_APP_ID)
     result = subprocess.run(
-        ["powershell.exe", "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", script],
+        [windows_tool(_POWERSHELL), "-NoProfile", "-NonInteractive", "-WindowStyle", "Hidden", "-EncodedCommand", script],
         env=env, capture_output=True, timeout=30, creationflags=_CREATE_NO_WINDOW, check=False,
     )
     if result.returncode != 0:
@@ -85,7 +88,7 @@ def _macos_notification(title: str, line1: str, line2: str, urgent: bool) -> Non
         "-e", "display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)",
         "-e", "end run",
     ]
-    subprocess.run(["osascript", *script, title, line1, line2], capture_output=True, timeout=30, check=True)
+    subprocess.run([_OSASCRIPT, *script, title, line1, line2], capture_output=True, timeout=30, check=True)
 
 
 def _linux_notification(title: str, line1: str, line2: str, urgent: bool) -> None:
@@ -104,9 +107,9 @@ def desktop_sender() -> Sender:
     """The best way to reach a human on this machine."""
     if os.environ.get("REDCASTLE_NOTIFY", "").lower() in {"off", "0", "false", "log"}:
         return _log_only
-    if sys.platform == "win32" and shutil.which("powershell.exe"):
+    if sys.platform == "win32" and os.path.isfile(windows_tool(_POWERSHELL)):
         return _windows_toast
-    if sys.platform == "darwin" and shutil.which("osascript"):
+    if sys.platform == "darwin" and os.path.isfile(_OSASCRIPT):
         return _macos_notification
     if shutil.which("notify-send"):
         return _linux_notification

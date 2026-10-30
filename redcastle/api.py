@@ -6,6 +6,7 @@ web interface and no admin endpoint here.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
@@ -22,6 +23,9 @@ from .registry import Status
 
 log = logging.getLogger("redcastle.api")
 MAX_BODY = 64 * 1024
+SOCKET_TIMEOUT = 30  # seconds a silent client may keep a connection open
+MAX_CONNECTIONS = 64  # at a time; the rest are turned away rather than given a thread each
+LOCAL_HOSTS = ("127.0.0.1", "localhost", "::1")
 
 # HTTP status for the agent's view of a fresh request
 REQUEST_STATUS_CODES = {Status.QUARANTINED: 202, Status.REJECTED: 403, Status.FAILED: 502}
@@ -51,12 +55,23 @@ class CastleHTTPServer(ThreadingHTTPServer):
 
     def __init__(self, address: tuple[str, int], castle: Castle) -> None:
         self.castle = castle
+        self._slots = threading.BoundedSemaphore(MAX_CONNECTIONS)
         super().__init__(address, CastleRequestHandler)
+
+    def verify_request(self, request: Any, client_address: Any) -> bool:
+        return self._slots.acquire(blocking=False)
+
+    def process_request_thread(self, request: Any, client_address: Any) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._slots.release()
 
 
 class CastleRequestHandler(BaseHTTPRequestHandler):
     server: CastleHTTPServer
     server_version = f"RedCastle/{__version__}"
+    timeout = SOCKET_TIMEOUT
 
     def do_GET(self) -> None:
         self._dispatch("GET")
@@ -86,8 +101,7 @@ class CastleRequestHandler(BaseHTTPRequestHandler):
             if route_method != method:
                 continue
             try:
-                with self.castle.lock:
-                    status, payload = getattr(self, handler)(*match.groups())
+                status, payload = getattr(self, handler)(*match.groups())
             except GatewayError as exc:
                 self._send(exc.http_status, {"error": exc.code, "message": str(exc)})
             except BadRequest as exc:
@@ -104,14 +118,18 @@ class CastleRequestHandler(BaseHTTPRequestHandler):
             self._send(404, {"error": "not_found", "message": "No such endpoint."})
 
     def _send(self, status: int, payload: Any) -> None:
-        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json; charset=utf-8")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        self.end_headers()
-        self.wfile.write(body)
+        # A file name that is not valid Unicode goes out as a JSON escape, not as a crash.
+        body = json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8", "backslashreplace")
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json; charset=utf-8")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionError, TimeoutError):  # the client hung up; nobody is left to tell
+            self.close_connection = True
 
     def _token(self) -> str | None:
         scheme, _, token = self.headers.get("Authorization", "").partition(" ")
@@ -124,10 +142,15 @@ class CastleRequestHandler(BaseHTTPRequestHandler):
             raise BadRequest("Invalid Content-Length.") from exc
         if length > MAX_BODY:
             raise BadRequest("The request body is too large.")
-        raw = self.rfile.read(length) if length > 0 else b""
         try:
-            data = json.loads(raw or b"{}")
-        except (ValueError, UnicodeDecodeError) as exc:
+            raw = self.rfile.read(length) if length > 0 else b""
+        except TimeoutError as exc:
+            raise BadRequest("Timed out waiting for the request body.") from exc
+        if len(raw) < length:  # a lost connection is no request, and must be no strike against the agent
+            raise BadRequest("The connection closed before the whole body arrived.")
+        try:
+            data = json.loads(raw)
+        except (ValueError, RecursionError) as exc:
             raise BadRequest("The body must be JSON.") from exc
         if not isinstance(data, dict):
             raise BadRequest("The body must be a JSON object.")
@@ -149,13 +172,18 @@ class CastleRequestHandler(BaseHTTPRequestHandler):
         return 200, {"ok": True}
 
     def objects(self) -> tuple[int, Any]:
-        return 200, self.castle.gateway.list_objects(self._token(), self.query.get("prefix", ""))
+        return 200, self.castle.gateway.list_objects(
+            self._token(), self.query.get("prefix", ""), self._int("limit", 1000, 1000), self.query.get("after", "")
+        )
 
     def create_request(self) -> tuple[int, Any]:
-        body = self._body()
-        view = self.castle.gateway.request_deletion(
-            self._token(), body.get("object_key", body.get("key")), body.get("reason"), body.get("risk_score")
-        )
+        token = self._token()
+        self.castle.gateway.authenticate(token)  # strangers do not get to make us wait for anything
+        body = self._body()  # read before the lock: a slow client must only ever delay itself
+        with self.castle.lock:
+            view = self.castle.gateway.request_deletion(
+                token, body.get("object_key", body.get("key")), body.get("reason"), body.get("risk_score")
+            )
         return REQUEST_STATUS_CODES.get(view["status"], 200), view
 
     def my_requests(self) -> tuple[int, Any]:
@@ -174,18 +202,30 @@ def serve(castle: Castle, host: str, port: int) -> None:
     Meanwhile the Watchtower patrols in the background, and the server watches
     for the stop flag that 'redcastle stop' leaves in the state folder.
     """
-    server = CastleHTTPServer((host, port), castle)
+    if host not in LOCAL_HOSTS:
+        log.warning("The gateway on %s has no TLS: agent tokens travel in the clear without a reverse proxy.", host)
+    with daemon.holding_gate(castle.config):
+        _run(castle, CastleHTTPServer((host, port), castle))
+
+
+def _run(castle: Castle, server: CastleHTTPServer) -> None:
     config = castle.config
+    host, port = server.server_address[:2]
     stop = threading.Event()
     interval = config.watchtower.patrol_interval_seconds
 
     def patrol_loop() -> None:
+        failing = False
         while not stop.wait(interval):
             try:
-                with castle.lock:
-                    castle.patrol()
-            except Exception:  # noqa: BLE001
+                castle.patrol()
+                failing = False
+            except Exception as exc:  # noqa: BLE001
                 log.exception("The Watchtower's patrol failed")
+                if not failing:  # a blind Watchtower is itself something a human must hear about
+                    failing = True
+                    with contextlib.suppress(Exception):
+                        castle.watchtower.alert("critical", "patrol_failed", f"The Watchtower's patrol failed: {exc}.")
 
     def stop_flag_loop() -> None:
         flag = daemon.stop_path(config)
@@ -196,7 +236,8 @@ def serve(castle: Castle, host: str, port: int) -> None:
                 server.shutdown()
                 return
 
-    daemon.write_pid(config, *server.server_address[:2])
+    daemon.stop_path(config).unlink(missing_ok=True)  # left by a castle that died mid-stop
+    daemon.write_pid(config, host, port)
     if interval > 0:
         threading.Thread(target=patrol_loop, name="watchtower", daemon=True).start()
     threading.Thread(target=stop_flag_loop, name="stop-flag", daemon=True).start()
