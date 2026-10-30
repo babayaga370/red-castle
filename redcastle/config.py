@@ -3,13 +3,23 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
 import secrets as _secrets
+import subprocess
 import tomllib
 from dataclasses import dataclass, field, fields
 from pathlib import Path
+from urllib.parse import urlsplit
+
+from .util import windows_tool
+
+log = logging.getLogger("redcastle.config")
 
 CONFIG_FILE = "redcastle.toml"
 STATE_DIR = ".redcastle"
+# Who may touch the castle's files on Windows: SYSTEM, the administrators and the owner.
+_PRIVATE_SIDS = ("S-1-5-18", "S-1-5-32-544", "S-1-3-4")
 
 
 class ConfigError(Exception):
@@ -71,7 +81,9 @@ class MoatConfig:
     max_requests_per_day: int = 200
     min_reason_length: int = 10
     protected_patterns: list[str] = field(
-        default_factory=lambda: ["*.pem", "*.key", "*/.git/*", "*/.ssh/*"]
+        default_factory=lambda: [
+            "*.pem", "*.key", "*.pfx", "*.p12", "*.kdbx", "*/.git", "*/.git/*", "*/.ssh/*", "*/.gnupg/*", "*/.aws/*",
+        ]
     )
 
 
@@ -170,12 +182,30 @@ def load_config(root: Path | str) -> Config:
             if key not in known:
                 raise ConfigError(f"{path}: unknown key '{key}' in [{section}]")
             expected = type(getattr(target, key))
-            if not isinstance(value, expected):
+            if not isinstance(value, expected) or (expected is int and isinstance(value, bool)):
                 raise ConfigError(
                     f"{path}: [{section}] {key} must be of type {expected.__name__}"
                 )
             setattr(target, key, value)
+    _validate(config, path)
     return config
+
+
+def _validate(config: Config, path: Path) -> None:
+    """Refuse at startup what would otherwise fail on the first request, or quietly misbehave."""
+    if config.notify.min_severity not in ("warning", "critical"):
+        raise ConfigError(f'{path}: [notify] min_severity must be "warning" or "critical"')
+    if not 0 <= config.server.port <= 65535:
+        raise ConfigError(f"{path}: [server] port must be from 0 to 65535")
+    webhook = config.watchtower.webhook_url
+    if webhook and urlsplit(webhook).scheme not in ("http", "https"):
+        raise ConfigError(f"{path}: [watchtower] webhook_url must be an http or https URL")
+    if not all(isinstance(pattern, str) for pattern in config.moat.protected_patterns):
+        raise ConfigError(f"{path}: [moat] protected_patterns must be a list of strings")
+    for table in ("sensitive_patterns", "low_value_patterns"):
+        for pattern, points in getattr(config.judge, table).items():
+            if not isinstance(points, int) or isinstance(points, bool):
+                raise ConfigError(f"{path}: [judge.{table}] '{pattern}' must be a whole number of points")
 
 
 def render_config(config: Config) -> str:
@@ -265,17 +295,46 @@ def _parse_secrets(data: dict) -> Secrets:
     )
 
 
+def write_private(path: Path, text: str) -> None:
+    """Create a file only this OS user can read; FileExistsError if it is already there."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as fh:
+        fh.write(text)
+
+
+def make_private(path: Path) -> bool:
+    """Close a file or folder to other users. A failure is logged: the castle still has to run."""
+    try:
+        if os.name == "nt":
+            inherited = "(OI)(CI)" if path.is_dir() else ""
+            subprocess.run(
+                [windows_tool("icacls.exe"), str(path), "/inheritance:r", "/grant:r",
+                 *(f"*{sid}:{inherited}F" for sid in _PRIVATE_SIDS)],
+                capture_output=True, timeout=30, check=True, creationflags=subprocess.CREATE_NO_WINDOW,
+            )
+        else:
+            path.chmod(0o700 if path.is_dir() else 0o600)
+    except (OSError, subprocess.SubprocessError) as exc:
+        log.warning("Could not make %s private: %s", path, exc)
+        return False
+    return True
+
+
 def create_secrets(path: Path) -> Secrets:
-    """Generate the castle's keys."""
-    if path.exists():
-        raise ConfigError(f"{path} already exists - refusing to overwrite the castle's keys.")
+    """Generate the castle's keys, readable by this OS user alone."""
     data = {"chronicle_key": _secrets.token_hex(32), "seal_key": _secrets.token_hex(32)}
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, indent=2), "utf-8")
+    path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    try:
+        write_private(path, json.dumps(data, indent=2))
+    except FileExistsError as exc:
+        raise ConfigError(f"{path} already exists - refusing to overwrite the castle's keys.") from exc
     return _parse_secrets(data)
 
 
 def load_secrets(path: Path) -> Secrets:
     if not path.exists():
         raise ConfigError(f"No castle here ({path} is missing). Run 'redcastle init' first.")
-    return _parse_secrets(json.loads(path.read_text("utf-8")))
+    try:
+        return _parse_secrets(json.loads(path.read_text("utf-8")))
+    except (ValueError, KeyError, TypeError) as exc:
+        raise ConfigError(f"{path} is damaged: {exc!r}") from exc

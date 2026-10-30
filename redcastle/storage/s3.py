@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ..config import ConfigError
 from .base import (
     Backend,
     InvalidKey,
@@ -44,6 +45,8 @@ class S3Backend(Backend):
         super().__init__(can_purge=can_purge)
         if not bucket:
             raise ValueError("The S3 backend needs a bucket ([storage] bucket = ...).")
+        if not quarantine_prefix.strip("/"):
+            raise ValueError("The S3 backend needs a quarantine prefix ([storage] quarantine_prefix = ...).")
         self.client = client
         self.bucket = bucket
         self.prefix = prefix.strip("/") + "/" if prefix.strip("/") else ""
@@ -53,7 +56,10 @@ class S3Backend(Backend):
 
     @classmethod
     def from_config(cls, storage: Any, *, executioner: bool = False) -> S3Backend:
-        import boto3  # optional dependency: pip install boto3
+        try:
+            import boto3  # optional dependency
+        except ImportError as exc:
+            raise ConfigError("The S3 backend needs boto3: pip install 'redcastle[s3]'") from exc
 
         profile = storage.profile
         if executioner and storage.executioner_profile:
@@ -72,6 +78,9 @@ class S3Backend(Backend):
         if full.startswith(self.qprefix):
             raise InvalidKey(f"'{key}' belongs to the castle's quarantine.")
         return full
+
+    def _qkey(self, key: str, case_id: str) -> str:
+        return f"{self.qprefix}{check_case_id(case_id)}/{normalize_key(key)}"
 
     def _head(self, full_key: str) -> dict | None:
         try:
@@ -113,13 +122,17 @@ class S3Backend(Backend):
         head = self._head(full)
         if head is None:
             raise ObjectNotFound(key)
-        qkey = f"{self.qprefix}{check_case_id(case_id)}/{normalize_key(key)}"
+        qkey = self._qkey(key, case_id)
         source = {"Bucket": self.bucket, "Key": full}
         version = head.get("VersionId")
         if version and version != "null":
             source["VersionId"] = version
         self.client.copy(source, self.bucket, qkey)
-        deleted = self.client.delete_object(Bucket=self.bucket, Key=full)
+        try:
+            deleted = self.client.delete_object(Bucket=self.bucket, Key=full)
+        except Exception:
+            self.client.delete_object(Bucket=self.bucket, Key=qkey)  # the original stayed: leave no stray copy
+            raise
         location: dict[str, str] = {"q": qkey, "orig": full}
         if version and version != "null":
             location["orig_version"] = version
@@ -136,6 +149,14 @@ class S3Backend(Backend):
             raise ObjectExists(key)
         self.client.copy({"Bucket": self.bucket, "Key": loc["q"]}, self.bucket, full)
         self.client.delete_object(Bucket=self.bucket, Key=loc["q"])
+
+    def find_hidden(self, key: str, case_id: str) -> str | None:
+        # Which versions the interrupted hide left behind is lost with it, so a later
+        # purge removes only the quarantined copy: too much is kept, never too little.
+        qkey = self._qkey(key, case_id)
+        if self._head(qkey) is None:
+            return None
+        return json.dumps({"q": qkey, "orig": self._full(key)}, sort_keys=True)
 
     def quarantined_checksum(self, location: str) -> str | None:
         head = self._head(json.loads(location)["q"])

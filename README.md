@@ -78,7 +78,8 @@ redcastle init
 
 `init` greets you with the castle and a short guide. It creates `redcastle.toml` (the
 configuration), `realm/` (the folder agents can see and ask to delete from) and
-`.redcastle/` (database, keys, quarantine and log; keep it private).
+`.redcastle/` (database, keys, quarantine and log). The castle keeps the last one and the
+configuration to your OS user.
 
 ```bash
 redcastle agent add claude
@@ -112,8 +113,12 @@ Every command accepts `--root <folder>` (or `REDCASTLE_HOME`) when the castle li
 | `redcastle stop` | Ask the castle to close its gates; forced after 15 seconds if it does not answer. |
 | `redcastle serve` | Run in the foreground of this terminal (Ctrl+C to stop). `--quiet` logs only to `.redcastle/castle.log`. |
 
+Only one castle can run from a folder at a time. A running castle holds an OS lock that the
+system releases when the process dies, so a crash never leaves it locked, and `stop` can never
+hit an unrelated program that happens to have inherited an old process id.
+
 The castle does not start at login by itself. To make it, schedule
-`pythonw -m redcastle --root <folder> serve --quiet` with Windows Task Scheduler (or launchd / systemd).
+`pythonw -P -m redcastle --root <folder> serve --quiet` with Windows Task Scheduler (or launchd / systemd).
 
 ## Notifications
 
@@ -167,19 +172,29 @@ object, the agent, its reason, both risk scores and the Judge's reasoning:
   [a]pprove (delete forever)  [r]estore  [s]kip  [f]reeze claude  [q]uit >
 ```
 
-Approving asks you to type `yes`. Every decision is recorded under your name (your
-username, or `--by`).
+Approving asks you to type a short code that differs per case, so it never becomes a reflex
+and no script can answer it blindly. Every decision is recorded under your name (your
+username, or `--by`). Whatever an agent wrote is shown with escape sequences, line breaks and
+bidi overrides spelled out (`\x1b[2K`), so a reason cannot redraw the screen or forge a line
+of the case you are reading.
+
+Approving, reviewing, thawing an agent, registering or rotating an agent and removing a canary
+need a human at a real terminal, and there is no flag to skip that. So an agent that merely has
+a shell, or that you allowed to run `redcastle`, cannot decide in your place. This is a speed
+bump, not a wall: see [Security model and limits](#security-model-and-limits). On Windows, use
+Windows Terminal, PowerShell or cmd; Git Bash needs `winpty` in front of the command.
 
 | Command | |
 |---|---|
 | `redcastle throne list` | Cases waiting in quarantine (`--status all` for everything) |
 | `redcastle throne show <id>` | One case, the Judge's reasoning and its Chronicle entries |
 | `redcastle throne approve <id>` | Approve; the Executioner deletes the object permanently |
-| `redcastle throne restore <id> [--as KEY]` | Decline and put the object back |
+| `redcastle throne restore <id> [--as KEY]` | Decline and put the object back (also after the Executioner refused an approved case) |
 | `redcastle throne freeze <agent> [--restore-all]` | Freeze an agent (and optionally restore all it asked for) |
 | `redcastle throne unfreeze <agent>` | Let it submit requests again |
+| `redcastle agent rotate <name>` | Replace a leaked token; the old one stops working at once |
 | `redcastle chronicle show --follow` | Watch every decision as it happens |
-| `redcastle chronicle verify` | Verify the hash chain |
+| `redcastle chronicle verify [--head SEQ:HASH]` | Verify the hash chain (and that a head you published is still in it) |
 | `redcastle watchtower alerts` / `patrol` | Recent alerts / check canaries, quarantine and Chronicle now |
 | `redcastle traps plant <key>` | Plant a canary |
 | `redcastle executioner run` | Carry out approved cases that are still pending |
@@ -193,7 +208,7 @@ Every call needs `Authorization: Bearer <agent token>`.
 
 | Method | Path | |
 |---|---|---|
-| GET | `/api/v1/objects?prefix=` | Visible objects (quarantined ones are hidden) |
+| GET | `/api/v1/objects?prefix=&after=&limit=` | Visible objects (quarantined ones are hidden), at most 1000 at a time |
 | POST | `/api/v1/deletion-requests` | `{"object_key", "reason", "risk_score"}` → 202 quarantined, 403 rejected |
 | GET | `/api/v1/deletion-requests` | Your own requests (`?status=`) |
 | GET | `/api/v1/deletion-requests/{id}` | Status of one of your requests |
@@ -201,6 +216,8 @@ Every call needs `Authorization: Bearer <agent token>`.
 ```bash
 curl -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" -d '{"object_key":"logs/app-2025.log","reason":"Last year log, already archived","risk_score":10}' http://127.0.0.1:8750/api/v1/deletion-requests
 ```
+
+A long listing comes in pages: when `truncated` is true, ask again with `after` set to `next_after`.
 
 ## For agents: MCP
 
@@ -223,7 +240,11 @@ its own token and cannot reach the database or the keys. For Claude Code, in `.m
 }
 ```
 
-Without `--gateway` the castle is opened in-process (needs `--root` and access to `.redcastle/`).
+Keep a file holding a token out of version control. The token only ever goes to the gateway you
+named: the client ignores proxies and refuses redirects.
+
+Without `--gateway` the castle is opened in-process (needs `--root` and access to `.redcastle/`),
+so the agent's process then holds the castle's keys. Use that only when you trust it anyway.
 
 ## How it works
 
@@ -234,8 +255,13 @@ received ──► rejected     (Moat: frozen agent, invalid key, protected obje
          ──► trapped      (a canary: the agent is frozen and only ever sees "rejected")
          ──► failed       (storage error; nothing was deleted)
          ──► quarantined ──► approved ──► executed
-                         └─► restored
+                         └─► restored ◄──┘  (until the Executioner has struck)
 ```
+
+If something breaks half-way, the object is never left out of reach. A step that fails after
+the object was moved puts it back. If even that fails, or the castle itself dies mid-request,
+a patrol finds the request a quarter of an hour later: an object already in quarantine comes
+before the human as a normal case, and a request that got no further is marked `failed`.
 
 ### The roles in the code
 
@@ -270,14 +296,18 @@ within an hour freeze the agent. Patterns and weights live in `redcastle.toml`.
 ### Around the wall
 
 - **Moat:** see `[moat]` in `redcastle.toml`. The castle's own files (`.redcastle/`,
-  `redcastle.toml`) are never reachable, even if the realm is the castle's own folder.
+  `redcastle.toml`) are never reachable, even if the realm is the castle's own folder. The
+  Moat and the Traps judge an object by its real name on disk, so `server.pem.`, `server.pem `
+  and `GIT~1` on Windows, or a link to a protected folder, change nothing.
 - **Watchtower:** freezes an agent on a sprung trap, after 5 Moat rejections within
   10 minutes, or after 3 underestimates within an hour. The running castle patrols every
-  minute: the Chronicle must verify, every canary must be in place and unchanged, and every
-  quarantined object must match its checksum. Each new problem raises an urgent
-  notification. An optional `webhook_url` receives alerts as JSON.
+  minute: the Chronicle must verify and not shrink, every canary must be in place and
+  unchanged, and every quarantined object must match its checksum. Whatever cannot be checked
+  counts as a problem too, and a patrol that fails outright raises an alert of its own. Each
+  new problem raises an urgent notification. An optional `webhook_url` receives alerts as JSON.
 - **Traps:** `redcastle traps plant "backups/db-dump-prod.sql"` writes a decoy with fake
-  credentials, or turns an existing object into a canary.
+  credentials, or turns an existing object into a canary. To the agent, a sprung trap reads
+  like any other request from a frozen agent.
 
 ### S3
 
@@ -304,17 +334,34 @@ The only irreversible call in the whole system is then made with the Executioner
 ## Security model and limits
 
 - **The Chronicle is tamper-*evident*, not tamper-proof.** Someone holding both the database
-  and `secrets.json` can rewrite history. Publish the head from `redcastle chronicle verify`
-  (sequence number and hash) somewhere else now and then to detect truncation too.
-- **Run the castle as a different OS user than the agent.** An agent with file access to
-  `.redcastle/` could run `throne approve` itself. With the local backend, an agent with a
-  shell can also delete files in `realm/` directly; the Traps and the patrols detect and
-  report that, but cannot prevent it. Real isolation needs separate users or containers, or
-  S3 with IAM.
-- Agent tokens are stored only as SHA-256 hashes. Text written by agents (such as object
-  keys) is XML-escaped before it reaches a notification.
+  and `secrets.json` can rewrite history. Publish the head that `redcastle chronicle verify`
+  prints (`SEQ:HASH`) somewhere else now and then, and pass it back with `--head` to detect
+  truncation too: the chain alone cannot show that its newest entries are gone.
+- **Run the castle as a different OS user than the agent.** This is the real wall. An agent
+  running as your own user can read the keys and the database, drive a terminal, and delete
+  files in `realm/` directly: the need for a terminal only stops the casual route, and the
+  Traps and the patrols detect tampering but cannot prevent it. Real isolation needs separate
+  users or containers, or S3 with IAM.
+- **Agents must never be able to write to the castle's folder itself.** Keep the realm a
+  subfolder, as `init` does. With write access to the folder, an agent could replace
+  `redcastle.toml` or `.redcastle/`.
+- **`.redcastle/` and `redcastle.toml` are private.** The castle sees to that itself every time
+  it opens: `0700` and `0600` on Linux and macOS, and on Windows an ACL that leaves only you,
+  SYSTEM and the administrators, without the permissions of the folder it lives in. Anyone
+  who can read them, or a webhook URL in them, can do what the castle can.
+- **Nothing is loaded from the folder you stand in.** The background castle and its
+  notifications only use full paths. `python -m redcastle` does add the current folder to
+  Python's search path, so do not run it from a folder agents can write to. The installed
+  `redcastle` command and `python -P -m redcastle` do not have that problem.
+- Agent tokens are stored only as SHA-256 hashes; `redcastle agent rotate` replaces a leaked
+  one. Text written by agents (such as object keys) is XML-escaped before it reaches a
+  notification, and escaped before it reaches your terminal or the log.
 - The HTTP server listens on `127.0.0.1` by default and has no TLS. Put a TLS-terminating
-  reverse proxy in front of it before exposing it to a network.
+  reverse proxy in front of it before exposing it to a network; the castle logs a warning when
+  it listens on anything else. It serves 64 connections at a time and turns away the rest, and
+  a client that goes quiet is cut off after 30 seconds and never holds up anyone else.
+- An agent far past its rate limits (twice over) gets `429` and is no longer even recorded, so
+  it cannot fill the disk through the Chronicle.
 
 ## Development
 

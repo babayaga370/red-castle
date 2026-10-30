@@ -41,10 +41,16 @@ TOOLS: list[dict] = [
     {
         "name": "list_objects",
         "title": "List objects",
-        "description": "List the objects you can see. Objects waiting in quarantine are hidden.",
+        "description": (
+            "List the objects you can see. Objects waiting in quarantine are hidden. A long listing "
+            "comes in pages: when 'truncated' is true, call again with after set to 'next_after'."
+        ),
         "inputSchema": {
             "type": "object",
-            "properties": {"prefix": {"type": "string", "description": "Only keys starting with this, e.g. 'reports/'."}},
+            "properties": {
+                "prefix": {"type": "string", "description": "Only keys starting with this, e.g. 'reports/'."},
+                "after": {"type": "string", "description": "Continue a truncated listing after this key."},
+            },
         },
         "annotations": {"readOnlyHint": True, "openWorldHint": False},
     },
@@ -101,7 +107,7 @@ TOOLS: list[dict] = [
 
 
 class AgentPort(Protocol):
-    def list_objects(self, prefix: str) -> dict: ...
+    def list_objects(self, prefix: str, after: str = "") -> dict: ...
     def request_deletion(self, object_key: Any, reason: Any, risk_score: Any) -> dict: ...
     def get_request(self, request_id: str) -> dict: ...
     def list_requests(self, status: str | None) -> list[dict]: ...
@@ -112,21 +118,23 @@ class LocalAgentPort:
         self.castle = castle
         self.token = token
 
-    def list_objects(self, prefix: str) -> dict:
-        with self.castle.lock:
-            return self.castle.gateway.list_objects(self.token, prefix)
+    def list_objects(self, prefix: str, after: str = "") -> dict:
+        return self.castle.gateway.list_objects(self.token, prefix, after=after)
 
     def request_deletion(self, object_key: Any, reason: Any, risk_score: Any) -> dict:
         with self.castle.lock:
             return self.castle.gateway.request_deletion(self.token, object_key, reason, risk_score)
 
     def get_request(self, request_id: str) -> dict:
-        with self.castle.lock:
-            return self.castle.gateway.get_request(self.token, request_id)
+        return self.castle.gateway.get_request(self.token, request_id)
 
     def list_requests(self, status: str | None) -> list[dict]:
-        with self.castle.lock:
-            return self.castle.gateway.list_requests(self.token, status)
+        return self.castle.gateway.list_requests(self.token, status)
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, *args: Any, **kwargs: Any) -> None:
+        return None
 
 
 class HttpAgentPort:
@@ -134,6 +142,8 @@ class HttpAgentPort:
         self.base_url = base_url.rstrip("/")
         self.token = token
         self.timeout = timeout
+        # The token goes to the gateway we were told about: not to a proxy, and not wherever a redirect points.
+        self._opener = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirects)
 
     def _call(self, method: str, path: str, body: dict | None = None) -> tuple[int, dict]:
         request = urllib.request.Request(
@@ -147,7 +157,7 @@ class HttpAgentPort:
             },
         )
         try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
+            with self._opener.open(request, timeout=self.timeout) as response:
                 return response.status, json.loads(response.read() or b"{}")
         except urllib.error.HTTPError as exc:
             with exc:
@@ -167,8 +177,8 @@ class HttpAgentPort:
             return payload
         raise GatewayError(payload.get("error", "error"), payload.get("message", f"HTTP {status}"), status)
 
-    def list_objects(self, prefix: str) -> dict:
-        return self._expect(*self._call("GET", "/api/v1/objects?" + urlencode({"prefix": prefix})))
+    def list_objects(self, prefix: str, after: str = "") -> dict:
+        return self._expect(*self._call("GET", "/api/v1/objects?" + urlencode({"prefix": prefix, "after": after})))
 
     def request_deletion(self, object_key: Any, reason: Any, risk_score: Any) -> dict:
         body = {"object_key": object_key, "reason": reason, "risk_score": risk_score}
@@ -217,6 +227,8 @@ class MCPServer:
             return None  # a notification, or a response to a request we never send
         msg_id = message["id"]
         params = message.get("params") or {}
+        if not isinstance(params, dict):
+            return _error(msg_id, -32602, "params must be an object.")
         try:
             if method == "initialize":
                 result = self._initialize(params)
@@ -230,6 +242,9 @@ class MCPServer:
                 return _error(msg_id, -32601, f"Method not found: {method}")
         except InvalidParams as exc:
             return _error(msg_id, -32602, str(exc))
+        except Exception:  # noqa: BLE001 - one bad message must not end the session
+            log.exception("%s failed", method)
+            return _error(msg_id, -32603, "Internal error")
         return {"jsonrpc": "2.0", "id": msg_id, "result": result}
 
     def _initialize(self, params: dict) -> dict:
@@ -252,15 +267,15 @@ class MCPServer:
             "get_deletion_request": self._get_request,
             "list_my_deletion_requests": self._list_requests,
         }
-        if name not in tools:
+        if not isinstance(name, str) or name not in tools:
             raise InvalidParams(f"Unknown tool: {name}")
         try:
             return _tool_result(tools[name](args))
         except GatewayError as exc:
             return _tool_result({"error": exc.code, "message": str(exc)}, is_error=True)
-        except Exception as exc:  # noqa: BLE001
+        except Exception:  # noqa: BLE001 - the details are for the log, not for the agent
             log.exception("Tool %s failed", name)
-            return _tool_result({"error": "internal_error", "message": str(exc)}, is_error=True)
+            return _tool_result({"error": "internal_error", "message": "Internal error."}, is_error=True)
 
     @staticmethod
     def _require(args: dict, *names: str) -> None:
@@ -269,7 +284,7 @@ class MCPServer:
             raise GatewayError("missing_arguments", f"Missing required argument(s): {', '.join(missing)}.")
 
     def _list_objects(self, args: dict) -> dict:
-        return self.port.list_objects(str(args.get("prefix") or ""))
+        return self.port.list_objects(str(args.get("prefix") or ""), str(args.get("after") or ""))
 
     def _request_deletion(self, args: dict) -> dict:
         self._require(args, "object_key", "reason", "risk_score")
@@ -291,10 +306,11 @@ class MCPServer:
                 continue
             try:
                 message = json.loads(line)
-            except ValueError:
+            except (ValueError, RecursionError):
                 response: Any = _error(None, -32700, "Parse error")
             else:
                 response = self.handle(message)
             if response is not None:
-                stdout.write(json.dumps(response, ensure_ascii=False).encode("utf-8") + b"\n")
+                # A file name that is not valid Unicode goes out as a JSON escape, not as a crash.
+                stdout.write(json.dumps(response, ensure_ascii=False).encode("utf-8", "backslashreplace") + b"\n")
                 stdout.flush()

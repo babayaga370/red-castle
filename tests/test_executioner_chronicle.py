@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import sqlite3
+import time
 import unittest
+from unittest import mock
 
 from redcastle.chronicle import Chronicle
 from redcastle.executioner import ExecutionRefused
 from redcastle.registry import Status
-from redcastle.seal import royal_seal
+from redcastle.seal import royal_seal, seal_is_valid
 
 from .helpers import CastleTestCase
 
@@ -54,6 +56,22 @@ class ExecutionerTests(CastleTestCase):
         self.castle.registry.transition(case["id"], Status.QUARANTINED, Status.APPROVED, seal=seal)
         self.assertEqual(self.castle.executioner.run_pending(), [(case["id"], "executed")])
 
+    def test_a_mangled_warrant_is_no_warrant(self) -> None:
+        good = royal_seal(b"key", "rc-1", "cell", "sha256:x")
+        self.assertTrue(seal_is_valid(b"key", good, "rc-1", "cell", "sha256:x"))
+        self.assertFalse(seal_is_valid(b"key", "sälj", "rc-1", "cell", "sha256:x"))
+        self.assertFalse(seal_is_valid(b"key", b"\xff", "rc-1", "cell", "sha256:x"))
+        self.assertFalse(seal_is_valid(b"key", good, "rc-1", None, "sha256:x"))
+
+    def test_refuses_what_it_cannot_verify(self) -> None:
+        case = self.quarantined()
+        seal = royal_seal(self.castle.throne._seal_key, case["id"], case["quarantine_location"], case["checksum"])
+        self.castle.registry.transition(case["id"], Status.QUARANTINED, Status.APPROVED, seal=seal)
+        with mock.patch.object(self.castle.executioner.backend, "quarantined_checksum", side_effect=OSError("locked")):
+            with self.assertRaises(ExecutionRefused):
+                self.castle.executioner.execute(case["id"])
+        self.assertTrue(self.castle.quarantine.intact(case["quarantine_location"], case["checksum"]))
+
 
 class ChronicleTests(CastleTestCase):
     def test_every_step_is_recorded_and_verifies(self) -> None:
@@ -96,6 +114,52 @@ class ChronicleTests(CastleTestCase):
 
     def test_wrong_key_does_not_verify(self) -> None:
         self.assertFalse(Chronicle(self.castle.db, b"not the key").verify().ok)
+
+    def test_a_row_of_the_wrong_kind_is_tampering_not_a_crash(self) -> None:
+        conn = self.castle.db.conn
+        conn.execute("DROP TRIGGER chronicle_no_update")
+        conn.execute("UPDATE chronicle SET data = x'00ff' WHERE seq = 1")
+        result = self.castle.chronicle.verify()
+        self.assertFalse(result.ok)
+        self.assertEqual(result.broken_at, 1)
+
+    def test_a_long_chain_is_verified_page_by_page(self) -> None:
+        for i in range(7):
+            self.castle.chronicle.record("test", "test.entry", i=i)
+        with mock.patch("redcastle.chronicle.VERIFY_PAGE", 3):
+            self.assertTrue(self.castle.chronicle.verify().ok)
+            self.assertEqual(self.castle.chronicle.verify().entries, self.castle.chronicle.head()["seq"])
+            conn = self.castle.db.conn
+            conn.execute("DROP TRIGGER chronicle_no_update")
+            conn.execute("UPDATE chronicle SET data = '{}' WHERE seq = 5")
+            self.assertEqual(self.castle.chronicle.verify().broken_at, 5)
+
+    def test_a_head_is_held_until_the_chronicle_loses_it(self) -> None:
+        head = self.castle.chronicle.head()
+        self.assertTrue(self.castle.chronicle.holds(head["seq"], head["hash"]))
+        self.assertFalse(self.castle.chronicle.holds(head["seq"], "0" * 64))
+        self.assertFalse(self.castle.chronicle.holds(head["seq"] + 1, head["hash"]))
+
+
+class WatchtowerAlertTests(CastleTestCase):
+    def test_short_commands_wait_for_their_webhooks(self) -> None:
+        delivered = []
+
+        def slow_endpoint(request: object, timeout: float) -> mock.MagicMock:
+            time.sleep(0.2)
+            delivered.append(request)
+            return mock.MagicMock()
+
+        self.castle.config.watchtower.webhook_url = "http://example.invalid/hook"
+        with mock.patch("redcastle.watchtower.urllib.request.urlopen", side_effect=slow_endpoint):
+            self.castle.watchtower.alert("critical", "test", "fire")
+            self.castle.watchtower.close()
+        self.assertEqual(len(delivered), 1)
+
+    def test_the_horn_sounds_even_if_the_records_cannot_be_kept(self) -> None:
+        with mock.patch.object(self.castle.watchtower.db, "execute", side_effect=sqlite3.OperationalError("disk full")):
+            self.castle.watchtower.alert("critical", "test", "fire")
+        self.assertEqual(self.notifications[0][1], "fire")
 
 
 if __name__ == "__main__":

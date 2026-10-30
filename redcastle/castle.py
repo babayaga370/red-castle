@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import threading
 from pathlib import Path
 
@@ -13,7 +14,9 @@ from .config import (
     create_secrets,
     load_config,
     load_secrets,
+    make_private,
     render_config,
+    write_private,
 )
 from .db import Database
 from .executioner import Executioner
@@ -29,6 +32,17 @@ from .traps import Traps
 from .watchtower import Watchtower
 
 
+def _lock_up(config: Config) -> None:
+    """Keep the keys, the database and the config from other OS users; Windows needs telling only once."""
+    marker = config.state_dir / ".private"
+    if os.name == "nt" and marker.exists():
+        return
+    config.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    paths = [p for p in (config.state_dir, config.root / CONFIG_FILE) if p.exists()]
+    if all([make_private(path) for path in paths]):
+        marker.touch()
+
+
 class Castle:
     def __init__(
         self,
@@ -40,8 +54,8 @@ class Castle:
         notifier: Notifier | None = None,
     ) -> None:
         self.config = config
-        self.lock = threading.RLock()  # serializes requests from the HTTP server's threads
-        config.state_dir.mkdir(parents=True, exist_ok=True)
+        self.lock = threading.RLock()  # deletion requests are decided and carried out one at a time
+        _lock_up(config)
         self.db = Database(config.db_path)
         self.registry = Registry(self.db)
         self.chronicle = Chronicle(self.db, secrets.chronicle_key)
@@ -71,10 +85,14 @@ class Castle:
         return cls(config, load_secrets(config.secrets_path))
 
     def patrol(self) -> dict:
+        with self.lock:
+            self.gateway.settle_interrupted()
+        # Outside the lock: hashing the quarantine must not hold up the Gateway.
         return self.watchtower.patrol(self.traps, self.backend)
 
     def close(self) -> None:
         self.notifier.flush()  # do not swallow a batch that is still waiting
+        self.watchtower.close()
         self.db.close()
 
     def __enter__(self) -> Castle:
@@ -92,8 +110,9 @@ def found_castle(root: Path | str, *, realm: str = "realm") -> Castle:
     if not config_path.exists():
         fresh = Config(root=root)
         fresh.storage.realm = realm
-        config_path.write_text(render_config(fresh), "utf-8")
+        write_private(config_path, render_config(fresh))
     config = load_config(root)
+    _lock_up(config)  # before the keys exist, not after
     secrets = create_secrets(config.secrets_path)
     (config.state_dir / ".gitignore").write_text("*\n", "utf-8")
     castle = Castle(config, secrets)

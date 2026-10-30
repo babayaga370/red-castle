@@ -36,6 +36,10 @@ REQUEST_COLUMNS = frozenset({
 })
 
 
+def _new_token() -> str:
+    return "rc_agent_" + secrets.token_urlsafe(32)
+
+
 def _request(row: Any) -> dict:
     case = dict(row)
     if case.get("judge_factors"):
@@ -51,18 +55,24 @@ class Registry:
 
     def add_agent(self, name: str) -> str:
         """Register an agent and return its token (only its hash is stored)."""
-        if not AGENT_NAME.match(name):
+        if not AGENT_NAME.fullmatch(name):
             raise ValueError(
                 "Agent names may contain letters, digits, '.', '_' and '-' (max 64 characters)."
             )
         if self.get_agent(name):
             raise ValueError(f"Agent '{name}' already exists.")
-        token = "rc_agent_" + secrets.token_urlsafe(32)
+        token = _new_token()
         self.db.execute(
             "INSERT INTO agents (name, token_hash, status, created_at) VALUES (?, ?, 'active', ?)",
             (name, hash_token(token), now()),
         )
         return token
+
+    def rotate_token(self, name: str) -> str | None:
+        """Give an agent a new token; the old one stops working at once. None if there is no such agent."""
+        token = _new_token()
+        cur = self.db.execute("UPDATE agents SET token_hash = ? WHERE name = ?", (hash_token(token), name))
+        return token if cur.rowcount == 1 else None
 
     def agent_by_token(self, token: str) -> dict | None:
         row = self.db.one("SELECT * FROM agents WHERE token_hash = ?", (hash_token(token),))

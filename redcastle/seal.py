@@ -19,4 +19,8 @@ def royal_seal(key: bytes, request_id: str, location: str, checksum: str) -> str
 def seal_is_valid(key: bytes, seal: str | None, request_id: str, location: str, checksum: str) -> bool:
     if not seal:
         return False
-    return hmac.compare_digest(seal, royal_seal(key, request_id, location, checksum))
+    try:
+        expected = royal_seal(key, request_id, location, checksum)
+        return hmac.compare_digest(str(seal).encode("utf-8"), expected.encode("utf-8"))
+    except (TypeError, ValueError):  # a record tampered with: no warrant, whatever it says
+        return False

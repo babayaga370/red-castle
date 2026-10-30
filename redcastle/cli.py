@@ -7,6 +7,8 @@ import getpass
 import logging
 import logging.handlers
 import os
+import signal
+import sqlite3
 import sys
 import tempfile
 import time
@@ -19,15 +21,27 @@ from .config import CONFIG_FILE, ConfigError, load_config, load_secrets
 from .executioner import ExecutionRefused
 from .gateway import GatewayError
 from .registry import Status
+from .storage import StorageError
 from .throne import ThroneError
-from .util import iso
+from .util import iso, printable
 
 log = logging.getLogger("redcastle.cli")
+LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+
+
+class SafeFormatter(logging.Formatter):
+    """Log lines end up on terminals too, and anyone who connects writes part of them."""
+
+    def formatMessage(self, record: logging.LogRecord) -> str:
+        return printable(super().formatMessage(record))
+
+    def formatException(self, ei: Any) -> str:
+        return "\n".join(printable(line) for line in super().formatException(ei).split("\n"))
 
 
 def _table(rows: list[list[Any]], headers: list[str], width: int = 48) -> str:
     def cell(value: Any) -> str:
-        text = "" if value is None else str(value)
+        text = "" if value is None else printable(str(value))
         return text if len(text) <= width else text[: width - 3] + "..."
 
     cells = [headers] + [[cell(v) for v in row] for row in rows]
@@ -54,6 +68,24 @@ def _ask(prompt: str) -> str:
         return input(prompt).strip()
     except EOFError:
         return "q"
+
+
+def _at_a_terminal() -> bool:
+    if not (sys.stdin and sys.stdin.isatty()):
+        return False
+    if os.name != "nt":
+        return True
+    # isatty() is also true for NUL on Windows, so ask the console itself.
+    import ctypes
+
+    kernel32 = ctypes.windll.kernel32
+    return bool(kernel32.GetConsoleMode(kernel32.GetStdHandle(-10), ctypes.byref(ctypes.c_uint32())))  # STD_INPUT_HANDLE
+
+
+def _confirmed(case: dict) -> bool:
+    """Ask for a code that differs per case, so that approving never becomes a reflex."""
+    code = case["id"][-4:]
+    return _ask(f"  Delete '{printable(case['object_key'])}' permanently? Type {code} to confirm: ").lower() == code
 
 
 # -- founding and agents --------------------------------------------------------
@@ -87,6 +119,18 @@ def cmd_agent_add(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_agent_rotate(args: argparse.Namespace) -> int:
+    with _open(args) as castle:
+        token = castle.registry.rotate_token(args.name)
+        if token is None:
+            print(f"error: there is no agent '{args.name}'.", file=sys.stderr)
+            return 2
+        castle.chronicle.record("castle", "agent.token_rotated", agent=args.name)
+    print(f"Agent '{args.name}' has a new token; the old one no longer works. The new one (shown only once):")
+    print(f"  {token}")
+    return 0
+
+
 def cmd_agent_list(args: argparse.Namespace) -> int:
     with _open(args) as castle:
         agents = castle.registry.list_agents()
@@ -101,22 +145,26 @@ def cmd_agent_list(args: argparse.Namespace) -> int:
 def cmd_serve(args: argparse.Namespace) -> int:
     from .api import serve
 
+    found = daemon.running(load_config(args.root))
+    if found:
+        raise ConfigError(f"Red Castle is already running (pid {found[0]}) on http://{found[1]}.")
     castle = _open(args)
     config = castle.config
     if args.quiet:
         handler = logging.handlers.RotatingFileHandler(
             daemon.log_path(config), maxBytes=1_000_000, backupCount=3, encoding="utf-8"
         )
-        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s"))
+        handler.setFormatter(SafeFormatter(LOG_FORMAT))
         logging.basicConfig(level=logging.INFO, handlers=[handler], force=True)
     host = args.host or config.server.host
     port = args.port or config.server.port
     if not args.quiet:
         print(f"Red Castle is open. Gateway for agents: http://{host}:{port}/api/v1")
         print("Desktop notifications tell you when something needs you. Press Ctrl+C to close the gates.")
+    signal.signal(signal.SIGTERM, lambda *_: sys.exit(0))  # how service managers ask: close the gates properly
     try:
         serve(castle, host, port)
-    except OSError as exc:
+    except (OSError, OverflowError) as exc:
         log.error("Cannot open the gateway on %s:%d: %s", host, port, exc)
         if not args.quiet:
             print(f"error: cannot open the gateway on {host}:{port}: {exc}", file=sys.stderr)
@@ -175,6 +223,7 @@ def cmd_status(args: argparse.Namespace) -> int:
     with _open(args) as castle:
         found = daemon.running(castle.config)
         pending = castle.throne.pending()
+        unfinished = castle.throne.unfinished()
         agents = castle.registry.list_agents()
         since = time.time() - 86400
         alerts = [a for a in castle.watchtower.alerts(500) if a["ts"] and a["ts"] >= iso(since)]
@@ -184,6 +233,8 @@ def cmd_status(args: argparse.Namespace) -> int:
     print("Castle:      " + (f"running silently (pid {found[0]}) on http://{found[1]}"
                              if found else "not running - start it with: redcastle start"))
     print(f"Quarantine:  {len(pending)} awaiting judgement" + (" - run: redcastle throne review" if pending else ""))
+    if unfinished:
+        print(f"Approved:    {len(unfinished)} not carried out - see: redcastle throne list --status approved")
     print(f"Agents:      {len(agents)}" + (f", frozen: {', '.join(frozen)}" if frozen else ""))
     print(f"Alerts 24h:  {critical} critical, {len(alerts) - critical} other" + (
         " - see: redcastle watchtower alerts" if alerts else ""))
@@ -214,9 +265,9 @@ def _describe(case: dict) -> list[str]:
     size = f"{case['size']} bytes" if case["size"] is not None else "size unknown"
     lines = [
         f"Case {case['id']}  [{case['status']}]  {_age(case['created_at'])} ago",
-        f"  object:     {case['object_key']}  ({size})",
+        f"  object:     {printable(case['object_key'])}  ({size})",
         f"  agent:      {case['agent']}",
-        f"  reason:     {case['reason']}",
+        f"  reason:     {printable(case['reason'])}",
     ]
     if case["judge_score"] is not None:
         flag = f"  <-- agent {case['flag'].upper()} the risk" if case["flag"] else ""
@@ -225,10 +276,10 @@ def _describe(case: dict) -> list[str]:
     else:
         lines.append(f"  risk:       agent {case['agent_score']}")
     if case["status_reason"]:
-        lines.append(f"  note:       {case['status_reason']}")
+        lines.append(f"  note:       {printable(case['status_reason'])}")
     if case["decided_by"]:
         note = f" - {case['decision_note']}" if case["decision_note"] else ""
-        lines.append(f"  decided by: {case['decided_by']} at {iso(case['decided_at'])}{note}")
+        lines.append(printable(f"  decided by: {case['decided_by']} at {iso(case['decided_at'])}{note}"))
     return lines
 
 
@@ -279,7 +330,7 @@ def cmd_throne_review(args: argparse.Namespace) -> int:
                 choice = _ask(f"  [a]pprove (delete forever)  [r]estore  [s]kip  [f]reeze {case['agent']}  [q]uit > ").lower()
                 try:
                     if choice in ("a", "approve"):
-                        if _ask(f"  Delete '{case['object_key']}' permanently? Type 'yes': ").lower() != "yes":
+                        if not _confirmed(case):
                             print("  Not deleted.")
                             continue
                         castle.throne.approve(case["id"], by=args.by)
@@ -303,7 +354,7 @@ def cmd_throne_review(args: argparse.Namespace) -> int:
                         print("  Choose a, r, s, f or q.")
                         continue
                 except ThroneError as exc:
-                    print(f"  ! {exc}")
+                    print(f"  ! {printable(str(exc))}")
                 break
         remaining = len(castle.throne.pending())
         print("\nThe quarantine is empty." if not remaining else f"\n{remaining} object(s) still await judgement.")
@@ -313,20 +364,19 @@ def cmd_throne_review(args: argparse.Namespace) -> int:
 def cmd_throne_approve(args: argparse.Namespace) -> int:
     with _open(args) as castle:
         case = castle.throne.case(args.id)
-        if not args.yes:
-            print("\n".join(_describe(case)))
-            if _ask("Delete it permanently? This cannot be undone. Type 'yes': ").lower() != "yes":
-                print("Nothing was done.")
-                return 1
+        print("\n".join(_describe(case)))
+        if not _confirmed(case):
+            print("Nothing was done.")
+            return 1
         case = castle.throne.approve(args.id, by=args.by, note=args.note)
-    print(f"Approved. The Executioner deleted '{case['object_key']}'.")
+    print(f"Approved. The Executioner deleted '{printable(case['object_key'])}'.")
     return 0
 
 
 def cmd_throne_restore(args: argparse.Namespace) -> int:
     with _open(args) as castle:
         case = castle.throne.restore(args.id, by=args.by, note=args.note, target_key=args.as_key)
-    print(f"Restored '{case['object_key']}'." + (f" {case['status_reason']}" if case["status_reason"] else ""))
+    print(printable(f"Restored '{case['object_key']}'." + (f" {case['status_reason']}" if case["status_reason"] else "")))
     return 0
 
 
@@ -337,7 +387,7 @@ def cmd_throne_freeze(args: argparse.Namespace) -> int:
     for request_id in result["restored"]:
         print(f"  restored {request_id}")
     for failure in result["failed"]:
-        print(f"  could not restore {failure['request_id']}: {failure['error']}")
+        print(f"  could not restore {failure['request_id']}: {printable(failure['error'])}")
     return 0
 
 
@@ -363,7 +413,8 @@ def cmd_executioner_run(args: argparse.Namespace) -> int:
 
 def _entry_line(entry: dict) -> str:
     about = entry["data"].get("request_id") or entry["data"].get("agent") or entry["data"].get("key") or ""
-    return f"#{entry['seq']:<6} {entry['ts'][:19].replace('T', ' ')}  {entry['actor']:<20} {entry['event']:<26} {about}"
+    line = f"#{entry['seq']:<6} {entry['ts'][:19].replace('T', ' ')}  {entry['actor']:<20} {entry['event']:<26} {about}"
+    return printable(line)
 
 
 def cmd_chronicle_show(args: argparse.Namespace) -> int:
@@ -393,14 +444,23 @@ def cmd_chronicle_verify(args: argparse.Namespace) -> int:
     with _open(args) as castle:
         result = castle.chronicle.verify()
         head = castle.chronicle.head()
-    if result.ok:
-        print(f"The Chronicle is intact: {result.entries} entries.")
-        if head:
-            print(f"Head: #{head['seq']} {head['hash']}")
-        return 0
-    print(f"THE CHRONICLE IS BROKEN at entry {result.broken_at}: {result.problem}.")
-    print(f"The first {result.entries} entries are intact.")
-    return 1
+        survived = True
+        if args.head:
+            seq, _, digest = args.head.lstrip("#").partition(":")
+            survived = seq.isdecimal() and castle.chronicle.holds(int(seq), digest.strip())
+    if not result.ok:
+        print(f"THE CHRONICLE IS BROKEN at entry {result.broken_at}: {result.problem}.")
+        print(f"The first {result.entries} entries are intact.")
+        return 1
+    if not survived:
+        print(f"THE CHRONICLE WAS REWRITTEN OR TRUNCATED: it no longer holds {args.head}.")
+        return 1
+    print(f"The Chronicle is intact: {result.entries} entries.")
+    if args.head:
+        print(f"It still holds the published head {args.head}.")
+    if head:
+        print(f"Head: {head['seq']}:{head['hash']}")
+    return 0
 
 
 def cmd_watchtower_status(args: argparse.Namespace) -> int:
@@ -435,7 +495,7 @@ def cmd_watchtower_patrol(args: argparse.Namespace) -> int:
         print("All is well.")
         return 0
     for problem in report["problems"]:
-        print(f"  ! {problem['message']}")
+        print(f"  ! {printable(problem['message'])}")
     return 1
 
 
@@ -558,6 +618,22 @@ def cmd_demo(args: argparse.Namespace) -> int:
 # -- argument parsing -------------------------------------------------------------
 
 
+class _Subcommand(argparse.ArgumentParser):
+    """Every command also takes --root after its name, not only before it."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        self.add_argument("--root", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
+
+
+def _me() -> str:
+    """This OS user's name; without one ("") every decision needs an explicit --by."""
+    try:
+        return getpass.getuser()
+    except (KeyError, OSError):  # a container user without a passwd entry, for one
+        return ""
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog=_prog(),
@@ -569,8 +645,8 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("-v", "--verbose", action="store_true", help="log more")
     parser.add_argument("--version", action="version", version=f"redcastle {__version__}")
     parser.set_defaults(func=cmd_welcome)
-    sub = parser.add_subparsers(dest="command", metavar="COMMAND")
-    me = getpass.getuser()
+    sub = parser.add_subparsers(dest="command", metavar="COMMAND", parser_class=_Subcommand)
+    me = _me()
 
     p = sub.add_parser("init", help="found a new castle in --root")
     p.add_argument("--realm", default="realm", help="folder the agents may see (local backend)")
@@ -579,7 +655,10 @@ def build_parser() -> argparse.ArgumentParser:
     agent = sub.add_parser("agent", help="register and list agents").add_subparsers(dest="sub", required=True)
     p = agent.add_parser("add", help="register an agent and print its token")
     p.add_argument("name")
-    p.set_defaults(func=cmd_agent_add)
+    p.set_defaults(func=cmd_agent_add, human_only=True)
+    p = agent.add_parser("rotate", help="replace an agent's token; the old one stops working at once")
+    p.add_argument("name")
+    p.set_defaults(func=cmd_agent_rotate, human_only=True)
     agent.add_parser("list", help="list agents").set_defaults(func=cmd_agent_list)
 
     p = sub.add_parser("start", help="run the castle silently in the background")
@@ -605,7 +684,7 @@ def build_parser() -> argparse.ArgumentParser:
         dest="sub", required=True)
     p = throne.add_parser("review", help="go through the quarantine case by case")
     p.add_argument("--by", default=me, help=f"your name (default: {me})")
-    p.set_defaults(func=cmd_throne_review)
+    p.set_defaults(func=cmd_throne_review, human_only=True)
     p = throne.add_parser("list", help="list cases (default: those waiting in quarantine)")
     p.add_argument("--status", default=Status.QUARANTINED, choices=[*Status.ALL, "all"])
     p.add_argument("--limit", type=int, default=200)
@@ -617,8 +696,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("id")
     p.add_argument("--by", default=me, help=f"your name (default: {me})")
     p.add_argument("--note", default="")
-    p.add_argument("--yes", action="store_true", help="do not ask for confirmation")
-    p.set_defaults(func=cmd_throne_approve)
+    p.set_defaults(func=cmd_throne_approve, human_only=True)
     p = throne.add_parser("restore", help="decline: put the object back")
     p.add_argument("id")
     p.add_argument("--by", default=me)
@@ -635,7 +713,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("agent")
     p.add_argument("--by", default=me)
     p.add_argument("--note", default="")
-    p.set_defaults(func=cmd_throne_unfreeze)
+    p.set_defaults(func=cmd_throne_unfreeze, human_only=True)
 
     executioner = sub.add_parser("executioner", help="the Executioner").add_subparsers(dest="sub", required=True)
     executioner.add_parser("run", help="carry out approved cases that are still pending").set_defaults(
@@ -647,7 +725,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--request", help="only entries about this case")
     p.add_argument("-f", "--follow", action="store_true", help="keep printing new entries as they happen")
     p.set_defaults(func=cmd_chronicle_show)
-    chronicle.add_parser("verify", help="verify the hash chain").set_defaults(func=cmd_chronicle_verify)
+    p = chronicle.add_parser("verify", help="verify the hash chain")
+    p.add_argument("--head", help="a head printed by an earlier verify (SEQ:HASH): is it still there?")
+    p.set_defaults(func=cmd_chronicle_verify)
 
     tower = sub.add_parser("watchtower", help="the Watchtower").add_subparsers(dest="sub", required=True)
     tower.add_parser("status", help="agents, cases and the Chronicle at a glance").set_defaults(
@@ -666,7 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
     traps.add_parser("list", help="list canaries").set_defaults(func=cmd_traps_list)
     p = traps.add_parser("remove", help="stop treating KEY as a canary")
     p.add_argument("key")
-    p.set_defaults(func=cmd_traps_remove)
+    p.set_defaults(func=cmd_traps_remove, human_only=True)
 
     notify = sub.add_parser("notify", help="desktop notifications").add_subparsers(dest="sub", required=True)
     notify.add_parser("test", help="send a test notification").set_defaults(func=cmd_notify_test)
@@ -683,11 +763,19 @@ def main(argv: list[str] | None = None) -> int:
             pass
     args = build_parser().parse_args(argv)
     level = logging.DEBUG if args.verbose else logging.INFO if args.command == "serve" else logging.WARNING
-    logging.basicConfig(level=level, stream=sys.stderr, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
+    handler = logging.StreamHandler(sys.stderr)
+    handler.setFormatter(SafeFormatter(LOG_FORMAT))
+    logging.basicConfig(level=level, handlers=[handler])
+    # A speed bump, not a wall: it stops an agent that merely has a shell, or an allowed 'redcastle' command,
+    # from deciding for the human. Keeping agents out of .redcastle/ for real takes a separate OS user.
+    if getattr(args, "human_only", False) and not _at_a_terminal():
+        print("error: this decision belongs to a human; run it yourself in a terminal.", file=sys.stderr)
+        return 2
     try:
         return args.func(args)
-    except (ConfigError, ThroneError, GatewayError, ExecutionRefused, ValueError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    except (ConfigError, ThroneError, GatewayError, ExecutionRefused, StorageError, ValueError,
+            OSError, sqlite3.Error) as exc:
+        print(f"error: {printable(str(exc))}", file=sys.stderr)
         return 2
     except KeyboardInterrupt:
         return 130

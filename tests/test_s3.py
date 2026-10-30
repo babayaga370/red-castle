@@ -6,6 +6,7 @@ import hashlib
 import json
 import unittest
 from datetime import datetime, timedelta, timezone
+from unittest import mock
 
 from redcastle.castle import Castle
 from redcastle.config import load_secrets
@@ -111,6 +112,33 @@ class S3BackendTests(unittest.TestCase):
         backend = S3Backend(self.s3, "bucket")
         with self.assertRaises(InvalidKey):
             backend.stat(".redcastle-quarantine/rc-1/a.txt")
+
+    def test_quarantine_needs_a_prefix_of_its_own(self) -> None:
+        with self.assertRaises(ValueError):
+            S3Backend(self.s3, "bucket", quarantine_prefix="/")
+
+    def test_a_failed_delete_leaves_no_stray_copy(self) -> None:
+        self.s3.put("realm/a.txt", b"a")
+        real_delete = self.s3.delete_object
+
+        def refuse_the_original(Bucket: str, Key: str) -> dict:
+            if Key == "realm/a.txt":
+                raise FakeClientError("AccessDenied")
+            return real_delete(Bucket=Bucket, Key=Key)
+
+        with mock.patch.object(self.s3, "delete_object", side_effect=refuse_the_original):
+            with self.assertRaises(FakeClientError):
+                self.backend.hide("a.txt", "rc-1")
+        self.assertEqual(list(self.s3.objects), ["realm/a.txt"])
+
+    def test_an_interrupted_hide_can_be_found_again(self) -> None:
+        self.s3.put("realm/a.txt", b"a")
+        self.assertIsNone(self.backend.find_hidden("a.txt", "rc-1"))
+        self.backend.hide("a.txt", "rc-1")
+        location = self.backend.find_hidden("a.txt", "rc-1")
+        self.assertIsNotNone(self.backend.quarantined_checksum(location))
+        self.backend.unhide(location, "a.txt")
+        self.assertIn("realm/a.txt", self.s3.objects)
 
 
 class S3CastleTests(CastleTestCase):
